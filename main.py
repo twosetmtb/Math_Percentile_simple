@@ -1,4 +1,14 @@
 # main.py
+# Streamlit Speed Math (Global Percentile)
+# - 10 random questions (+, -, ×, ÷)
+# - One question at a time: press Enter to submit and instantly move on
+# - Auto-focus + auto-select the CURRENT question's textbox (no mouse tax)
+# - Constraints:
+#     * |answer| <= 143 for all questions
+#     * division quotient (answer) <= 12
+# - Communal scores using a shared SQLite DB file (global_scores.db)
+#   (Shared across all users on the same deployed server)
+
 import time
 import random
 import sqlite3
@@ -7,6 +17,7 @@ from dataclasses import dataclass
 
 import streamlit as st
 
+# ----------------- Config -----------------
 NUM_QUESTIONS = 10
 MAX_ABS_ANSWER = 143
 MAX_DIV_ANSWER = 12
@@ -14,14 +25,15 @@ DB_PATH = Path("global_scores.db")
 
 st.set_page_config(page_title="Speed Math Global", page_icon="", layout="centered")
 
-# ---------- Data ----------
+
+# ----------------- Models -----------------
 @dataclass
 class Question:
     text: str
     answer: int
 
 
-# ---------- Question generation ----------
+# ----------------- Question generation -----------------
 def clamp_ok(ans: int) -> bool:
     return abs(ans) <= MAX_ABS_ANSWER
 
@@ -30,8 +42,8 @@ def make_question(rng: random.Random) -> Question:
     op = rng.choice(["+", "-", "×", "÷"])
 
     if op == "÷":
-        q = rng.randint(0, MAX_DIV_ANSWER)
-        b = rng.randint(1, 12)
+        q = rng.randint(0, MAX_DIV_ANSWER)   # quotient <= 12
+        b = rng.randint(1, 12)              # divisor
         a = b * q
         return Question(f"{a} ÷ {b}", q)
 
@@ -51,7 +63,8 @@ def make_question(rng: random.Random) -> Question:
             if clamp_ok(ans):
                 return Question(f"{a} + {b}", ans)
 
-    while True:  # "-"
+    # "-"
+    while True:
         a = rng.randint(-12, 12)
         b = rng.randint(-12, 12)
         ans = a - b
@@ -59,7 +72,7 @@ def make_question(rng: random.Random) -> Question:
             return Question(f"{a} - {b}", ans)
 
 
-# ---------- Global communal DB (SQLite file) ----------
+# ----------------- Global communal DB (SQLite file) -----------------
 def _get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(
@@ -79,6 +92,7 @@ def _get_db_connection() -> sqlite3.Connection:
 
 @st.cache_resource
 def db_conn() -> sqlite3.Connection:
+    # One shared connection per server process
     return _get_db_connection()
 
 
@@ -98,15 +112,52 @@ def get_global_scores() -> list[float]:
 
 
 def percentile_rank(user_score: float, history: list[float]) -> float | None:
+    # Higher percentile = better. Lower score is better.
     if not history:
         return None
-    worse = sum(1 for s in history if s > user_score)  # lower score is better
+    worse = sum(1 for s in history if s > user_score)
     return 100.0 * worse / len(history)
 
 
-# ---------- Helpers ----------
+# ----------------- Focus helper -----------------
+def autofocus_last_text_input():
+    st.components.v1.html(
+        """
+        <script>
+        (function() {
+          const focusLast = () => {
+            const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+            if (!inputs || inputs.length === 0) return false;
+            const el = inputs[inputs.length - 1];
+            el.focus();
+            if (el.select) el.select();
+            return true;
+          };
+
+          // Try immediately and then keep trying briefly (Streamlit renders async)
+          let tries = 0;
+          const iv = setInterval(() => {
+            tries++;
+            const ok = focusLast();
+            if (ok || tries > 60) clearInterval(iv);
+          }, 15);
+
+          // Also react to DOM changes for the next-question rerender
+          const obs = new MutationObserver(() => focusLast());
+          obs.observe(window.parent.document.body, { childList: true, subtree: true });
+
+          // Stop observing after a short time to avoid overhead
+          setTimeout(() => obs.disconnect(), 1200);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+# ----------------- Session helpers -----------------
 def reset_all():
-    for k in ["started", "finished", "start_time", "questions", "idx", "user_answers", "last_run", "focus_nonce"]:
+    for k in ["started", "finished", "start_time", "questions", "idx", "user_answers", "last_run", "needs_focus"]:
         st.session_state.pop(k, None)
     st.rerun()
 
@@ -126,7 +177,7 @@ def finish_quiz(show_answers: bool):
     accuracy = correct / len(questions)
     score = float("inf") if accuracy == 0 else (1.0 / accuracy) * time_taken
 
-    history = get_global_scores()
+    history = get_global_scores()  # global history before insert
     pct = None if score == float("inf") else percentile_rank(score, history)
 
     if score != float("inf"):
@@ -144,35 +195,9 @@ def finish_quiz(show_answers: bool):
     st.rerun()
 
 
-def autofocus_text_input():
-    """
-    Forces focus onto the first text input on the page.
-    Streamlit doesn't expose a native autofocus param, so we do a tiny JS poke.
-    This runs fast and reduces the "click-to-focus" time tax.
-    """
-    st.components.v1.html(
-        """
-        <script>
-        const tryFocus = () => {
-          const input = window.parent.document.querySelector('input[type="text"]');
-          if (input) { input.focus(); input.select?.(); return true; }
-          return false;
-        };
-        // Try immediately, then a few more times (DOM timing)
-        let attempts = 0;
-        const iv = setInterval(() => {
-          attempts++;
-          if (tryFocus() || attempts > 20) clearInterval(iv);
-        }, 25);
-        </script>
-        """,
-        height=0,
-    )
-
-
-# ---------- UI ----------
-st.title("Global Speed Math")
-st.caption("Score = (1/accuracy) × time_taken_seconds  •  lower is better   •  Percentile is vs everyone ")
+# ----------------- UI -----------------
+st.title("🔥 Global Speed Math")
+st.caption("Score = (1/accuracy) × time_taken_seconds  •  lower is better 🙏  •  Percentile is vs everyone 💀")
 
 show_answers = st.checkbox("Show correct answers at end", value=True)
 st.divider()
@@ -181,31 +206,36 @@ if "started" not in st.session_state:
     st.session_state.started = False
 if "finished" not in st.session_state:
     st.session_state.finished = False
-if "focus_nonce" not in st.session_state:
-    st.session_state.focus_nonce = 0  # changes force component refresh
+if "needs_focus" not in st.session_state:
+    st.session_state.needs_focus = False
 
+# ---------- Start screen ----------
 if not st.session_state.started:
-    st.write("Press **Start**. Then complete questions until finished (10 questions)")
+    st.write("Press **Start**. Continue until finished (10 questions)")
 
-    if st.button("Start", type="primary", use_container_width=True):
-        rng = random.Random()  # no seed (removed)
-        st.session_state.questions = [make_question(rng) for _ in range(NUM_QUESTIONS)]
-        st.session_state.user_answers = [None] * NUM_QUESTIONS
-        st.session_state.idx = 0
-        st.session_state.start_time = time.perf_counter()
-        st.session_state.started = True
-        st.session_state.finished = False
-        st.session_state.focus_nonce += 1
-        st.rerun()
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("Start", type="primary", use_container_width=True):
+            rng = random.Random()  # no seed
+            st.session_state.questions = [make_question(rng) for _ in range(NUM_QUESTIONS)]
+            st.session_state.user_answers = [None] * NUM_QUESTIONS
+            st.session_state.idx = 0
+            st.session_state.start_time = time.perf_counter()
+            st.session_state.started = True
+            st.session_state.finished = False
+            st.session_state.needs_focus = True
+            st.rerun()
 
+# ---------- Quiz / Results ----------
 else:
+    # Results
     if st.session_state.finished:
         r = st.session_state.last_run
         st.success("Done")
 
         st.write(f"**Time taken:** {r['time_taken']:.3f} s")
         st.write(f"**Accuracy:** {r['correct']}/{NUM_QUESTIONS} = {r['accuracy']*100:.1f}%")
-        st.write(f"**Final score:** {r['score']:.4f}" if r["score"] != float("inf") else "**Final score:** ∞ (accuracy was 0)")
+        st.write(f"**Final score:** {r['score']:.4f}" if r["score"] != float("inf") else "**Final score:** ∞ (accuracy was 0 💀)")
 
         if r["percentile"] is None:
             st.write("**Percentile:** N/A (not enough global data yet, or score was ∞)")
@@ -226,37 +256,43 @@ else:
                 )
 
         st.divider()
-        if st.button("New run", use_container_width=True):
+        if st.button("🔁 New run", use_container_width=True, type="primary"):
             reset_all()
 
+    # In progress
     else:
         idx = st.session_state.idx
         questions: list[Question] = st.session_state.questions
         q = questions[idx]
 
-        st.info("Timer is running - Enter submits instantly")
+        st.info("Timer is running… press Enter to go to the next question")
         st.progress(idx / NUM_QUESTIONS)
         st.write(f"**Question {idx+1}/{NUM_QUESTIONS}**")
         st.markdown(f"### {q.text} = ?")
 
-        # Render autofocus hook (nonce forces refresh per question)
-        _ = st.session_state.focus_nonce
-        autofocus_text_input()
+        # Unique input key for this question
+        input_key = f"answer_input_{idx}"
 
-        # One-question form => Enter submits => next question
+        # Form => Enter submits
         with st.form(f"single_q_form_{idx}", clear_on_submit=True):
-            raw = st.text_input("Answer", value="", placeholder="e.g. 42")
+            raw = st.text_input("Answer", value="", placeholder="e.g. 42", key=input_key)
             submitted = st.form_submit_button("Next (Enter)")
+
+        # Focus the CURRENT input if needed
+        if st.session_state.needs_focus:
+            autofocus_last_text_input()
+            st.session_state.needs_focus = False
 
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
-            if st.button("⏭ Skip", use_container_width=True):
+            if st.button("Skip", use_container_width=True):
                 st.session_state.user_answers[idx] = None
                 st.session_state.idx += 1
-                st.session_state.focus_nonce += 1
+                st.session_state.needs_focus = True
                 if st.session_state.idx >= NUM_QUESTIONS:
                     finish_quiz(show_answers)
-                st.rerun()
+                else:
+                    st.rerun()
 
         with c2:
             if st.button("Finish Quiz", type="primary", use_container_width=True):
@@ -275,9 +311,14 @@ else:
 
             st.session_state.user_answers[idx] = val
             st.session_state.idx += 1
-            st.session_state.focus_nonce += 1  # force autofocus refresh next Q
+            st.session_state.needs_focus = True
 
             if st.session_state.idx >= NUM_QUESTIONS:
                 finish_quiz(show_answers)
             else:
                 st.rerun()
+
+        # Also add focus script at the end to ensure it runs even if we missed it above
+        if not st.session_state.needs_focus:
+            # Run focus anyway to ensure it's focused
+            autofocus_last_text_input()
