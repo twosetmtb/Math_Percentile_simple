@@ -1,19 +1,16 @@
-# app.py
 import time
 import random
-import csv
-import os
-from dataclasses import dataclass
+import math
 import streamlit as st
+from dataclasses import dataclass
 
-SCORES_FILE = "scores.csv"
 NUM_QUESTIONS = 10
+MAX_ABS_ANSWER = 143
+MAX_DIV_ANSWER = 12
 
-MAX_ABS_ANSWER = 143          # answers must be under 144 in magnitude
-MAX_DIV_ANSWER = 12           # division highest answer (quotient)
+st.set_page_config(page_title="Speed Math Global", page_icon="🔥", layout="centered")
 
-st.set_page_config(page_title="Speed Math", page_icon="🔥", layout="centered")
-
+# ---------- Question gen ----------
 @dataclass
 class Question:
     text: str
@@ -23,25 +20,15 @@ def clamp_ok(ans: int) -> bool:
     return abs(ans) <= MAX_ABS_ANSWER
 
 def make_question(rng: random.Random) -> Question:
-    """
-    Generates +, -, ×, ÷ questions with constraints:
-    - abs(answer) <= 143
-    - division answer <= 12
-    """
     op = rng.choice(["+", "-", "×", "÷"])
 
     if op == "÷":
-        # quotient <= 12, keep operands reasonable, ensure integer division
         q = rng.randint(0, MAX_DIV_ANSWER)
-        b = rng.randint(1, 12)   # divisor
+        b = rng.randint(1, 12)
         a = b * q
-        # a can be 0..144, but q<=12 and b<=12 => a<=144; if 144 happens, q=12,b=12 => a=144; answer still 12 ok
-        # answer constraint is about answer, not operands. If you also want operands <144, it's still fine.
         return Question(f"{a} ÷ {b}", q)
 
     if op == "×":
-        # ensure product within abs <= 143
-        # choose a and b from small ranges then validate
         while True:
             a = rng.randint(-12, 12)
             b = rng.randint(-12, 12)
@@ -51,65 +38,84 @@ def make_question(rng: random.Random) -> Question:
 
     if op == "+":
         while True:
-            a = rng.randint(1, 12)
-            b = rng.randint(1, 12)
+            a = rng.randint(-99, 99)
+            b = rng.randint(-99, 99)
             ans = a + b
             if clamp_ok(ans):
                 return Question(f"{a} + {b}", ans)
 
-    # op == "-"
+    # "-"
     while True:
-        a = rng.randint(1, 24)
-        b = rng.randint(1, 24)
+        a = rng.randint(-99, 99)
+        b = rng.randint(-99, 99)
         ans = a - b
         if clamp_ok(ans):
             return Question(f"{a} - {b}", ans)
 
-def load_scores() -> list[float]:
-    if not os.path.exists(SCORES_FILE):
-        return []
-    out = []
-    with open(SCORES_FILE, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                out.append(float(row["score"]))
-            except Exception:
-                pass
-    return out
+# ---------- Global communal storage (SQLite via Streamlit connection) ----------
+# This is persisted on Streamlit Community Cloud and is shared by all users.
+@st.cache_resource
+def get_conn():
+    # Streamlit provides a built-in sqlite connection on Community Cloud
+    return st.connection("sqlite", type="sql")
 
-def save_score(score: float, accuracy: float, time_taken: float):
-    file_exists = os.path.exists(SCORES_FILE)
-    with open(SCORES_FILE, "a", newline="") as f:
-        fieldnames = ["timestamp", "score", "accuracy", "time_taken"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(
-            {
-                "timestamp": int(time.time()),
-                "score": score,
-                "accuracy": accuracy,
-                "time_taken": time_taken,
-            }
-        )
+def init_db():
+    conn = get_conn()
+    conn.query(
+        """
+        CREATE TABLE IF NOT EXISTS scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            score REAL NOT NULL,
+            accuracy REAL NOT NULL,
+            time_taken REAL NOT NULL
+        );
+        """,
+        ttl=0,
+    )
+
+def insert_score(score: float, accuracy: float, time_taken: float):
+    conn = get_conn()
+    # Use parameterized insert
+    conn.query(
+        """
+        INSERT INTO scores (ts, score, accuracy, time_taken)
+        VALUES (:ts, :score, :accuracy, :time_taken);
+        """,
+        params={
+            "ts": int(time.time()),
+            "score": float(score),
+            "accuracy": float(accuracy),
+            "time_taken": float(time_taken),
+        },
+        ttl=0,
+    )
+
+def get_global_scores(limit: int | None = None) -> list[float]:
+    conn = get_conn()
+    q = "SELECT score FROM scores"
+    if limit:
+        q += " ORDER BY id DESC LIMIT :lim"
+        df = conn.query(q, params={"lim": limit}, ttl=0)
+    else:
+        df = conn.query(q, ttl=0)
+    if df is None or df.empty:
+        return []
+    return [float(x) for x in df["score"].tolist()]
 
 def percentile_rank(user_score: float, history: list[float]) -> float | None:
-    """
-    Higher percentile = better.
-    Lower score is better, so percentile counts how many past scores are WORSE (greater).
-    """
+    # higher percentile = better. lower score is better => count scores worse (greater)
     if not history:
         return None
     worse = sum(1 for s in history if s > user_score)
     return 100.0 * worse / len(history)
 
+# ---------- App state helpers ----------
 def reset_all():
-    keys = [
+    for k in [
         "started", "finished", "start_time", "questions", "idx",
-        "user_answers", "last_input", "seed"
-    ]
-    for k in keys:
+        "user_answers", "seed", "last_run"
+    ]:
         st.session_state.pop(k, None)
     st.rerun()
 
@@ -128,22 +134,30 @@ def finish_quiz(show_answers: bool):
     accuracy = correct / len(questions)
     score = float("inf") if accuracy == 0 else (1.0 / accuracy) * time_taken
 
-    history = load_scores()
-    save_score(score, accuracy, time_taken)
-    pct = percentile_rank(score, history)  # compare vs history BEFORE this run
+    # Get global history BEFORE inserting (so percentile is vs existing attempts)
+    history = get_global_scores()
+    pct = None if score == float("inf") else percentile_rank(score, history)
+
+    # Save to global DB (skip inf runs so they don't poison the dataset)
+    if score != float("inf"):
+        insert_score(score, accuracy, time_taken)
 
     st.session_state.finished = True
-    st.session_state.time_taken = time_taken
-    st.session_state.correct = correct
-    st.session_state.accuracy = accuracy
-    st.session_state.score = score
-    st.session_state.percentile = pct
-    st.session_state.show_answers = show_answers
-
+    st.session_state.last_run = {
+        "time_taken": time_taken,
+        "correct": correct,
+        "accuracy": accuracy,
+        "score": score,
+        "percentile": pct,
+        "show_answers": show_answers,
+    }
     st.rerun()
 
-st.title("🔥 Speed Math (Enter-to-Next)")
-st.caption("Score = (1/accuracy) × time_taken_seconds  •  lower is better 🙏")
+# ---------- UI ----------
+st.title("🔥 Global Speed Math")
+st.caption("Communal leaderboard vibes: your percentile is vs *everyone*. Lower score = better 🙏")
+
+init_db()
 
 col1, col2 = st.columns(2)
 with col1:
@@ -159,7 +173,7 @@ if "finished" not in st.session_state:
     st.session_state.finished = False
 
 if not st.session_state.started:
-    st.write("Press **Start**. Then spam until finished :)")
+    st.write("Press **Start**. Then mash Enter like it owes you money 😭")
 
     if st.button("🚀 Start", type="primary", use_container_width=True):
         rng = random.Random(int(seed) if seed != 0 else None)
@@ -173,30 +187,28 @@ if not st.session_state.started:
         st.rerun()
 
 else:
-    # finished screen
     if st.session_state.finished:
-        st.success("Done")
+        r = st.session_state.last_run
+        st.success("Done 🔥")
 
-        time_taken = st.session_state.time_taken
-        correct = st.session_state.correct
-        accuracy = st.session_state.accuracy
-        score = st.session_state.score
-        pct = st.session_state.percentile
+        st.write(f"**Time taken:** {r['time_taken']:.3f} s")
+        st.write(f"**Accuracy:** {r['correct']}/{NUM_QUESTIONS} = {r['accuracy']*100:.1f}%")
+        st.write(f"**Final score:** {r['score']:.4f}" if r["score"] != float("inf") else "**Final score:** ∞ (accuracy was 0 💀)")
 
-        st.write(f"**Time taken:** {time_taken:.3f} s")
-        st.write(f"**Accuracy:** {correct}/{NUM_QUESTIONS} = {accuracy*100:.1f}%")
-        st.write(f"**Final score:** {score:.4f}" if score != float("inf") else "**Final score:** ∞ (accuracy was 0 💀)")
-
-        if pct is None:
-            st.write("**Percentile:** N/A (no history yet on this device)")
+        if r["percentile"] is None:
+            st.write("**Percentile:** N/A (not enough global data yet, or score was ∞)")
         else:
-            st.write(f"**Percentile:** {pct:.1f}th (higher = better)")
+            st.write(f"**Percentile:** {r['percentile']:.1f}th (higher = better)")
 
-        if st.session_state.get("show_answers", True):
+        # Optional: show total attempts
+        global_scores = get_global_scores()
+        st.caption(f"Global attempts recorded: **{len(global_scores)}**")
+
+        if r.get("show_answers", True):
             st.divider()
             st.subheader("Review")
             for i, q in enumerate(st.session_state.questions, start=1):
-                ua = st.session_state.user_answers[i-1]
+                ua = st.session_state.user_answers[i - 1]
                 ok = (ua == q.answer)
                 st.write(
                     f"Q{i}. {q.text} = **{q.answer}**  |  you: **{ua if ua is not None else '—'}**  "
@@ -204,47 +216,41 @@ else:
                 )
 
         st.divider()
-        st.caption("History is stored in scores.csv on this machine. Delete it to reset percentile baselines.")
         if st.button("🔁 New run", use_container_width=True):
             reset_all()
 
     else:
-        # in-progress
+        idx = st.session_state.idx
         questions: list[Question] = st.session_state.questions
-        idx: int = st.session_state.idx
+        q = questions[idx]
 
-        st.info("Timer is running… Enter submits and jumps to the next one")
-
-        # Progress
+        st.info("Timer is running… Enter submits and jumps to the next one 🥷er 💀")
         st.progress(idx / NUM_QUESTIONS)
         st.write(f"**Question {idx+1}/{NUM_QUESTIONS}**")
-
-        q = questions[idx]
         st.markdown(f"### {q.text} = ?")
 
-        # Form so Enter triggers submit
         with st.form("single_q_form", clear_on_submit=True):
             raw = st.text_input("Type answer and press Enter", value="", placeholder="e.g. 42")
             submitted = st.form_submit_button("Next (Enter)")
 
-        colA, colB, colC = st.columns([1, 1, 1])
-        with colA:
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
             if st.button("⏭ Skip", use_container_width=True):
                 st.session_state.user_answers[idx] = None
                 st.session_state.idx += 1
                 if st.session_state.idx >= NUM_QUESTIONS:
                     finish_quiz(show_answers)
                 st.rerun()
-        with colB:
-            if st.button("Finish Quiz", type="primary", use_container_width=True):
-                # Finish immediately, even if you haven't answered all
+
+        with c2:
+            if st.button("🏁 Finish Quiz", type="primary", use_container_width=True):
                 finish_quiz(show_answers)
-        with colC:
-            if st.button("Reset", use_container_width=True):
+
+        with c3:
+            if st.button("🔁 Reset", use_container_width=True):
                 reset_all()
 
         if submitted:
-            # store answer (or None if invalid)
             raw = raw.strip()
             try:
                 val = int(raw)
