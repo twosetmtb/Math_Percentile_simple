@@ -30,7 +30,7 @@ SCORES_TABLE = "speed_math_scores"
 
 st.set_page_config(
     page_title="Speed Math Global",
-    page_icon="🧮",
+    page_icon=" ",
     layout="centered",
 )
 
@@ -227,7 +227,7 @@ def finish_quiz(show_answers: bool) -> None:
     # Finite, always:
     # score = (1/accuracy)*time would explode; we clamp accuracy to EPS to avoid inf.
     effective_acc = max(accuracy, SCORE_EPS)
-    score = (1.0 / effective_acc) * time_taken
+    score = ((1.0 / effective_acc)**2) * time_taken
 
     # Percentile vs GLOBAL history BEFORE inserting this run
     history, total_count = get_global_scores_supabase()
@@ -257,7 +257,7 @@ def finish_quiz(show_answers: bool) -> None:
 
 # ----------------- UI -----------------
 st.title("Global Speed Math")
-st.caption("Score = (1/accuracy) × time_taken_seconds  •  lower is better   •  Percentile is vs everyone")
+st.caption("Score = (1/accuracy)^2 × time_taken_seconds  •  lower is better   •  Percentile is vs everyone")
 
 # Settings row
 col1, col2 = st.columns(2)
@@ -269,7 +269,7 @@ with col2:
 # Supabase status
 if not supabase_available():
     st.warning(
-        "Supabase not configured — runs will still work, but **global percentile + global attempts** are disabled. 🙏"
+        "Supabase not configured: runs will still work, but **global percentile + global attempts** are disabled."
     )
 
 st.divider()
@@ -300,7 +300,7 @@ else:
     # Finished screen
     if st.session_state.finished:
         r = st.session_state.last_run
-        st.success("Done 🔥")
+        st.success("Done")
 
         st.write(f"**Time taken:** {r['time_taken']:.3f} s")
         st.write(f"**Accuracy:** {r['correct']}/{NUM_QUESTIONS} = {r['accuracy']*100:.1f}%")
